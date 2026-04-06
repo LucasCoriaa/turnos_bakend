@@ -1,266 +1,274 @@
-/* ================================================================
-   server.js — Servidor principal
-   Express + PostgreSQL para el sistema de turnos
-================================================================ */
-
-const express  = require('express');
-const cors     = require('cors');
-const { Pool } = require('pg');
+console.log('Iniciando servidor...');
 require('dotenv').config();
+console.log('DATABASE_URL cargada:', process.env.DATABASE_URL ? 'SI' : 'NO');
 
-const app  = express();
-const port = process.env.PORT || 3000;
+const express = require('express');
+const cors    = require('cors');
+const pg      = require('pg');
 
-/* ── Middleware ──────────────────────────────────────────────── */
+const app = express();
 app.use(cors());
 app.use(express.json());
 
-/* ── Conexión a PostgreSQL ───────────────────────────────────── */
-const pool = new Pool({
-  connectionString: `postgresql://${process.env.DB_USER}:${process.env.DB_PASS}@${process.env.DB_HOST}/${process.env.DB_NAME}?uselibpqcompat=true&sslmode=require`,
+console.log('Creando pool...');
+const db = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+console.log('Pool creado');
+
+db.on('error', (err) => {
+  console.error('Error en pool de DB:', err.message);
 });
 
-pool.connect((err) => {
-  if (err) {
-    console.error('❌ Error conectando a PostgreSQL:', err.message);
-  } else {
-    console.log('✅ Conectado a PostgreSQL');
+/* ── INIT BASE DE DATOS ─────────────────────────────────────── */
+async function initDB() {
+  console.log('Conectando a la base de datos...');
+  try {
+    await db.query('SELECT 1');
+    console.log('Conexion exitosa!');
+  } catch(e) {
+    console.error('Error de conexion:', e.message);
+    process.exit(1);
   }
-});
 
-pool.on('error', (err) => {
-  console.error('Error inesperado en el pool:', err.message);
-});
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS businesses (
+      id          TEXT PRIMARY KEY,
+      name        TEXT NOT NULL,
+      emoji       TEXT,
+      category    TEXT,
+      phone       TEXT,
+      address     TEXT,
+      active      BOOLEAN DEFAULT true,
+      schedule    JSONB,
+      theme       JSONB
+    )
+  `);
 
-/* ================================================================
-   RUTAS — NEGOCIOS
-================================================================ */
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS services (
+      id          SERIAL PRIMARY KEY,
+      business_id TEXT REFERENCES businesses(id) ON DELETE CASCADE,
+      name        TEXT NOT NULL,
+      duration    INTEGER,
+      price       INTEGER,
+      icon        TEXT,
+      active      BOOLEAN DEFAULT true
+    )
+  `);
 
-// GET /api/businesses — todos los negocios
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS bookings (
+      id          SERIAL PRIMARY KEY,
+      business_id TEXT REFERENCES businesses(id) ON DELETE CASCADE,
+      service_id  INTEGER REFERENCES services(id) ON DELETE SET NULL,
+      date        DATE NOT NULL,
+      time        TIME NOT NULL,
+      name        TEXT NOT NULL,
+      phone       TEXT NOT NULL,
+      email       TEXT,
+      notes       TEXT,
+      status      TEXT DEFAULT 'confirmed',
+      created_at  TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS blocked_dates (
+      id          SERIAL PRIMARY KEY,
+      business_id TEXT REFERENCES businesses(id) ON DELETE CASCADE,
+      date        DATE NOT NULL,
+      reason      TEXT,
+      UNIQUE(business_id, date)
+    )
+  `);
+
+  await db.query(`
+    INSERT INTO businesses (id, name, emoji, category, phone, active, schedule, theme)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    ON CONFLICT (id) DO NOTHING
+  `, [
+    'biz_001',
+    'Barberia Demo',
+    '💈',
+    'Barberia profesional',
+    '5493513824513',
+    true,
+    JSON.stringify({
+      workDays:    [1,2,3,4,5,6],
+      slotMinutes: 30,
+      blocks: [
+        { startHour: 9,  endHour: 13 },
+        { startHour: 15, endHour: 20 }
+      ]
+    }),
+    JSON.stringify({
+      accent:        '#c9a84c',
+      accentLight:   '#e2c97e',
+      accentDim:     'rgba(201,168,76,0.12)',
+      bgMain:        '#0e0e0e',
+      bgCard:        '#161616',
+      bgElevated:    '#1f1f1f',
+      border:        '#2a2a2a',
+      textPrimary:   '#f0ece4',
+      textSecondary: '#8a8580',
+      textMuted:     '#4a4845'
+    })
+  ]);
+
+  console.log('Base de datos lista');
+}
+
+/* ── BUSINESSES ─────────────────────────────────────────────── */
 app.get('/api/businesses', async (req, res) => {
   try {
-    const result = await pool.query(
-      'SELECT * FROM businesses WHERE active = true ORDER BY created_at'
-    );
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error en GET /businesses:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+    const { rows } = await db.query('SELECT * FROM businesses');
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// GET /api/businesses/:id — un negocio por ID
 app.get('/api/businesses/:id', async (req, res) => {
   try {
-    const result = await pool.query(
-      'SELECT * FROM businesses WHERE id = $1',
-      [req.params.id]
-    );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Negocio no encontrado' });
-    }
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error('Error en GET /businesses/:id:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+    const { rows } = await db.query('SELECT * FROM businesses WHERE id = $1', [req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
+    res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/* ================================================================
-   RUTAS — SERVICIOS
-================================================================ */
-
-// GET /api/businesses/:id/services — servicios de un negocio
+/* ── SERVICES ───────────────────────────────────────────────── */
 app.get('/api/businesses/:id/services', async (req, res) => {
   try {
-    const result = await pool.query(
-      'SELECT * FROM services WHERE business_id = $1 AND active = true ORDER BY created_at',
+    const { rows } = await db.query(
+      'SELECT * FROM services WHERE business_id = $1 ORDER BY id',
       [req.params.id]
     );
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error en GET /services:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/businesses/:id/services — agregar servicio
 app.post('/api/businesses/:id/services', async (req, res) => {
-  const { name, duration, price, icon } = req.body;
   try {
-    const result = await pool.query(
+    const { name, duration, price, icon } = req.body;
+    const { rows } = await db.query(
       'INSERT INTO services (business_id, name, duration, price, icon) VALUES ($1,$2,$3,$4,$5) RETURNING *',
-      [req.params.id, name, duration, price, icon]
+      [req.params.id, name, duration, price, icon || '⭐']
     );
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error('Error en POST /services:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+    res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// PATCH /api/services/:id — actualizar servicio
 app.patch('/api/services/:id', async (req, res) => {
-  const { name, duration, price, icon, active } = req.body;
   try {
-    const result = await pool.query(
-      `UPDATE services SET
-        name     = COALESCE($1, name),
-        duration = COALESCE($2, duration),
-        price    = COALESCE($3, price),
-        icon     = COALESCE($4, icon),
-        active   = COALESCE($5, active)
-       WHERE id = $6 RETURNING *`,
-      [name, duration, price, icon, active, req.params.id]
+    const fields = Object.keys(req.body);
+    const values = Object.values(req.body);
+    const set    = fields.map((f, i) => f + ' = $' + (i + 1)).join(', ');
+    const { rows } = await db.query(
+      'UPDATE services SET ' + set + ' WHERE id = $' + (fields.length + 1) + ' RETURNING *',
+      [...values, req.params.id]
     );
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error('Error en PATCH /services/:id:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+    res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// DELETE /api/services/:id — eliminar servicio
 app.delete('/api/services/:id', async (req, res) => {
   try {
-    await pool.query('UPDATE services SET active = false WHERE id = $1', [req.params.id]);
+    await db.query('DELETE FROM services WHERE id = $1', [req.params.id]);
     res.json({ ok: true });
-  } catch (err) {
-    console.error('Error en DELETE /services/:id:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/* ================================================================
-   RUTAS — TURNOS (BOOKINGS)
-================================================================ */
-
-// GET /api/businesses/:id/bookings — turnos de un negocio
+/* ── BOOKINGS ───────────────────────────────────────────────── */
 app.get('/api/businesses/:id/bookings', async (req, res) => {
   try {
-    let query  = 'SELECT * FROM bookings WHERE business_id = $1 AND status != $2';
-    let params = [req.params.id, 'cancelled'];
-
-    if (req.query.date) {
-      query += ' AND date = $3';
-      params.push(req.query.date);
-    }
-
-    query += ' ORDER BY date, time';
-    const result = await pool.query(query, params);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error en GET /bookings:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+    const { date } = req.query;
+    const query  = date
+      ? 'SELECT * FROM bookings WHERE business_id = $1 AND date = $2 ORDER BY time'
+      : 'SELECT * FROM bookings WHERE business_id = $1 ORDER BY date, time';
+    const params = date ? [req.params.id, date] : [req.params.id];
+    const { rows } = await db.query(query, params);
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/businesses/:id/bookings — crear turno
 app.post('/api/businesses/:id/bookings', async (req, res) => {
-  const { service_id, date, time, name, phone, email, notes } = req.body;
-
   try {
-    // Verificar doble reserva
-    const existing = await pool.query(
-      'SELECT id FROM bookings WHERE business_id=$1 AND service_id=$2 AND date=$3 AND time=$4 AND status!=$5',
-      [req.params.id, service_id, date, time, 'cancelled']
+    const { service_id, date, time, name, phone, email, notes } = req.body;
+
+    const { rows: existing } = await db.query(
+      "SELECT id FROM bookings WHERE business_id = $1 AND service_id = $2 AND date = $3 AND time = $4 AND status != 'cancelled'",
+      [req.params.id, service_id, date, time]
     );
+    if (existing.length > 0) return res.status(409).json({ error: 'Este horario ya esta reservado' });
 
-    if (existing.rows.length > 0) {
-      return res.status(409).json({ error: 'Este horario ya está reservado' });
-    }
-
-    const result = await pool.query(
-      `INSERT INTO bookings (business_id, service_id, date, time, name, phone, email, notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+    const { rows } = await db.query(
+      'INSERT INTO bookings (business_id, service_id, date, time, name, phone, email, notes) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
       [req.params.id, service_id, date, time, name, phone, email || null, notes || null]
     );
-
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error('Error en POST /bookings:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+    res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// DELETE /api/bookings/:id — cancelar turno
 app.delete('/api/bookings/:id', async (req, res) => {
   try {
-    await pool.query(
-      'UPDATE bookings SET status=$1 WHERE id=$2',
-      ['cancelled', req.params.id]
-    );
+    await db.query('DELETE FROM bookings WHERE id = $1', [req.params.id]);
     res.json({ ok: true });
-  } catch (err) {
-    console.error('Error en DELETE /bookings/:id:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// DELETE /api/businesses/:id/bookings — borrar todos los turnos
 app.delete('/api/businesses/:id/bookings', async (req, res) => {
   try {
-    await pool.query(
-      'UPDATE bookings SET status=$1 WHERE business_id=$2',
-      ['cancelled', req.params.id]
-    );
+    await db.query('DELETE FROM bookings WHERE business_id = $1', [req.params.id]);
     res.json({ ok: true });
-  } catch (err) {
-    console.error('Error en DELETE /businesses/:id/bookings:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/* ================================================================
-   RUTAS — FECHAS BLOQUEADAS
-================================================================ */
-
-// GET /api/businesses/:id/blocked
+/* ── BLOCKED DATES ──────────────────────────────────────────── */
 app.get('/api/businesses/:id/blocked', async (req, res) => {
   try {
-    const result = await pool.query(
+    const { rows } = await db.query(
       'SELECT * FROM blocked_dates WHERE business_id = $1 ORDER BY date',
       [req.params.id]
     );
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error en GET /blocked:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/businesses/:id/blocked — bloquear fecha
 app.post('/api/businesses/:id/blocked', async (req, res) => {
-  const { date, reason } = req.body;
   try {
-    const result = await pool.query(
-      `INSERT INTO blocked_dates (business_id, date, reason)
-       VALUES ($1,$2,$3)
-       ON CONFLICT (business_id, date) DO NOTHING RETURNING *`,
-      [req.params.id, date, reason || 'Día no disponible']
+    const { date, reason } = req.body;
+    const { rows } = await db.query(
+      'INSERT INTO blocked_dates (business_id, date, reason) VALUES ($1,$2,$3) ON CONFLICT (business_id, date) DO UPDATE SET reason = $3 RETURNING *',
+      [req.params.id, date, reason]
     );
-    res.json(result.rows[0] || { ok: true });
-  } catch (err) {
-    console.error('Error en POST /blocked:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+    res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// DELETE /api/businesses/:id/blocked/:date — desbloquear fecha
 app.delete('/api/businesses/:id/blocked/:date', async (req, res) => {
   try {
-    await pool.query(
-      'DELETE FROM blocked_dates WHERE business_id=$1 AND date=$2',
+    await db.query(
+      'DELETE FROM blocked_dates WHERE business_id = $1 AND date = $2',
       [req.params.id, req.params.date]
     );
     res.json({ ok: true });
-  } catch (err) {
-    console.error('Error en DELETE /blocked/:date:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/* ── Arrancar servidor ───────────────────────────────────────── */
-app.listen(port, () => {
-  console.log(`🚀 Servidor corriendo en http://localhost:${port}`);
+/* ── ARRANCAR ───────────────────────────────────────────────── */
+const PORT = process.env.PORT || 3000;
+
+console.log('Llamando initDB...');
+initDB().then(() => {
+  app.listen(PORT, () => {
+    console.log('Servidor corriendo en http://localhost:' + PORT);
+  });
+}).catch(err => {
+  console.error('ERROR EN INITDB:', err.message);
+  console.error(err.stack);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (err) => {
+  console.error('ERROR NO MANEJADO:', err.message);
 });
